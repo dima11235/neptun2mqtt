@@ -87,6 +87,7 @@ class NeptunSocket:
 
     def __init__(self, owner, type=socket.SOCK_STREAM, port=SERVER_PORT):
 
+        self._rxbuf = bytearray()
         self.owner = owner
         self.sock = None
         self.is_udp = type == socket.SOCK_DGRAM
@@ -98,6 +99,41 @@ class NeptunSocket:
         self._request_timeout = 0
         self.last_activity = datetime.datetime.now()
         self.prepare_socket()
+
+    def _process_rxbuf(self, sock):
+        """
+        Выделяет из self._rxbuf один/несколько полных кадров:
+        - начало по 0x02 0x54 (третий байт может быть 'Q' или 'A')
+        - конец определяется по корректному CRC16 последних 2 байт
+        """
+        START2 = b'\x02\x54'
+        while True:
+            i = self._rxbuf.find(START2)
+            if i == -1:
+                if len(self._rxbuf) > 1:
+                    del self._rxbuf[:-1]  # оставим 1 байт на стыке
+                break
+            if i > 0:
+                del self._rxbuf[:i]
+
+            if len(self._rxbuf) < 6:
+                break  # нужно минимум несколько байт + CRC
+
+            found = False
+            max_len = min(len(self._rxbuf), 4096)
+            for end in range(6, max_len + 1):
+                pkt = self._rxbuf[:end]
+                if len(pkt) >= 4 and crc16_check(pkt):
+                    try:
+                        self.handle_incoming_data(sock, self.ip, pkt)
+                    except Exception as e:
+                        self.log_traceback('Unhandled exception in frame handler', e)
+                    del self._rxbuf[:end]
+                    found = True
+                    break
+
+            if not found:
+                break
 
     def prepare_socket(self):
         if self.sock is None:
@@ -178,6 +214,14 @@ class NeptunSocket:
             else:
                 self.owner.log(_error, res)
             self.last_activity = datetime.datetime.now()
+
+            # ← добавьте этот блок:
+            try:
+                time.sleep(0.1)
+                self.owner.send_reconnect()   # 0x57
+                time.sleep(0.1)
+            except Exception as e:
+                self.owner.log_traceback("Post-connect hello failed", e)
 
             if not self.is_udp:
                 if (os.name == "posix"):
@@ -506,14 +550,14 @@ class NeptunConnector(threading.Thread):
                         self.handle_incoming_data(self.socket, addr[0], data)
                 else:
                     data = self.socket.sock.recv(SOCKET_BUFSIZE)
-                    if data:
-                        if self.debug_mode > 1:
-                            self.log('<--', self.ip, ":", self._formatBuffer(data))
-                        # аккумулируем TCP-стрим и вытаскиваем кадры
-                        self._rxbuf += data
-                        self._process_rxbuf(self.socket)
-
+                    if not data:
+                        return True  # пустое чтение — игнор
+                    if self.debug_mode > 1:
+                        self.log('<--', self.ip, ":", self._formatBuffer(data))
+                    self._rxbuf += data
+                    self._process_rxbuf(self.socket)
             return True
+        
         except socket.timeout as e:
             pass
 
@@ -532,9 +576,9 @@ class NeptunConnector(threading.Thread):
         """
         Handle an incoming data packet (control checksum, decode to a readable format)
         """
-        if len(data) < 4:
-            # self.log("Invalid length of a data packet")
-            return False
+        #if len(data) < 4:
+        #    # self.log("Invalid length of a data packet")
+        #    return False
 
         if not crc16_check(data):
             self.log("Invalid checksum of a data packet")
@@ -848,7 +892,7 @@ class NeptunConnector(threading.Thread):
         """
         data = bytearray([2, 84, 81, PACKET_SYSTEM_STATE, 0, 0])
         data = crc16_append(data)
-        self.send_command(data, self.ip, self.port, 15)
+        self.send_command(data, self.ip, self.port, 30)
         return self
 
     def send_get_background_status(self):
