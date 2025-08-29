@@ -119,8 +119,8 @@ class NeptunSocket:
             pass
 
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFSIZE)
-        sock.bind(('', self.port))
-
+        # НЕ биндим локальный порт для клиентского TCP:
+        # sock.bind(('', self.port))
         return sock
 
     def _prepare_socket_udp(self):
@@ -319,6 +319,9 @@ class NeptunConnector(threading.Thread):
 
         self.log_prefix = '[' + ip + ']:'
 
+        # буфер входящего TCP-потока
+        self._rxbuf = bytearray()
+
         threading.Thread.__init__(self)
 
     def terminate(self):
@@ -430,6 +433,46 @@ class NeptunConnector(threading.Thread):
             s.append('SENSOR OFFLINE')
         return ','.join(s)
 
+    def _process_rxbuf(self, sock):
+        """
+        Извлекает из self._rxbuf один или несколько полных кадров и
+        передаёт их в handle_incoming_data(). Кадр:
+          - начинается с 0x02 0x54 0x51
+          - заканчивается корректным CRC16 (последние 2 байта)
+        """
+        START = b'\x02\x54\x51'
+        while True:
+            i = self._rxbuf.find(START)
+            if i == -1:
+                # нет префикса: держим последние 2 байта как «хвост»
+                if len(self._rxbuf) > 2:
+                    del self._rxbuf[:-2]
+                break
+            if i > 0:
+                del self._rxbuf[:i]
+
+            if len(self._rxbuf) < 6:
+                # пока слишком коротко, ждём догрузки
+                break
+
+            found = False
+            max_len = min(len(self._rxbuf), 2048)
+            for end in range(6, max_len + 1):
+                pkt = self._rxbuf[:end]
+                if len(pkt) >= 4 and crc16_check(pkt):
+                    # полный кадр; передаём на разбор
+                    try:
+                        self.handle_incoming_data(sock, self.ip, pkt)
+                    except Exception as e:
+                        self.log_traceback('Unhandled exception in frame handler', e)
+                    del self._rxbuf[:end]
+                    found = True
+                    break
+
+            if not found:
+                # полного кадра пока нет
+                break
+
     def check_incoming(self):
         """
         Check incoming data, close unused TCP connections.
@@ -447,18 +490,22 @@ class NeptunConnector(threading.Thread):
 
         self.socket.check_close_conn()
 
-        data = None
         try:
             if self.socket.connected:
-                data, addr = self.socket.sock.recvfrom(SOCKET_BUFSIZE)
-                if self.debug_mode > 1:
-                    if self.socket.is_udp:
-                        addr = addr[0]
-                    else:
-                        addr = self.ip
-                    self.log('<--', addr, ":", self._formatBuffer(data))
-                if data is not None:
-                    self.handle_incoming_data(self.socket, addr, data)
+                if self.socket.is_udp:
+                    data, addr = self.socket.sock.recvfrom(SOCKET_BUFSIZE)
+                    if data:
+                        if self.debug_mode > 1:
+                            self.log('<--', addr[0], ":", self._formatBuffer(data))
+                        self.handle_incoming_data(self.socket, addr[0], data)
+                else:
+                    data = self.socket.sock.recv(SOCKET_BUFSIZE)
+                    if data:
+                        if self.debug_mode > 1:
+                            self.log('<--', self.ip, ":", self._formatBuffer(data))
+                        # аккумулируем TCP-стрим и вытаскиваем кадры
+                        self._rxbuf += data
+                        self._process_rxbuf(self.socket)
 
             return True
         except socket.timeout as e:
@@ -472,7 +519,7 @@ class NeptunConnector(threading.Thread):
                 self.log("Other socket error (%r)" % (e))
 
         except Exception as e:
-            self.log_traceback("Can't incoming data %r" % (data), e)
+            self.log_traceback("Can't incoming data %r" % (data if 'data' in locals() else None), e)
             raise
 
     def handle_incoming_data(self, sock, ip, data):
@@ -625,7 +672,11 @@ class NeptunConnector(threading.Thread):
                     idx = 0
                     while(offset < data_len):
                         sensor_info = self.get_line_info(idx)
-                        value = (data[offset] << 24) + (data[offset] << 16) + (data[offset] << 8) + (data[offset] << 24)
+                        # FIX: корректное чтение 4 байтов BE
+                        value = (data[offset]   << 24) + \
+                                (data[offset+1] << 16) + \
+                                (data[offset+2] <<  8) + \
+                                (data[offset+3])
                         sensor_info['value'] = value
                         sensor_info['step'] = data[offset + 4]
                         self.set_line_info(idx, sensor_info)
