@@ -30,6 +30,7 @@ PACKET_SENSOR_STATE = 0x53
 PACKET_BACK_STATE = 0x42
 PACKET_RECONNECT = 0x57
 PACKET_SET_SYSTEM_STATE = 0x57
+PACKET_ACK = 0xFB  # короткий ACK/keepalive
 
 BROADCAST_PORT = 6350
 BROADCAST_ADDRESS = '255.255.255.255'
@@ -87,7 +88,6 @@ class NeptunSocket:
 
     def __init__(self, owner, type=socket.SOCK_STREAM, port=SERVER_PORT):
 
-        self._rxbuf = bytearray()
         self.owner = owner
         self.sock = None
         self.is_udp = type == socket.SOCK_DGRAM
@@ -99,41 +99,6 @@ class NeptunSocket:
         self._request_timeout = 0
         self.last_activity = datetime.datetime.now()
         self.prepare_socket()
-
-    def _process_rxbuf(self, sock):
-        """
-        Выделяет из self._rxbuf один/несколько полных кадров:
-        - начало по 0x02 0x54 (третий байт может быть 'Q' или 'A')
-        - конец определяется по корректному CRC16 последних 2 байт
-        """
-        START2 = b'\x02\x54'
-        while True:
-            i = self._rxbuf.find(START2)
-            if i == -1:
-                if len(self._rxbuf) > 1:
-                    del self._rxbuf[:-1]  # оставим 1 байт на стыке
-                break
-            if i > 0:
-                del self._rxbuf[:i]
-
-            if len(self._rxbuf) < 6:
-                break  # нужно минимум несколько байт + CRC
-
-            found = False
-            max_len = min(len(self._rxbuf), 4096)
-            for end in range(6, max_len + 1):
-                pkt = self._rxbuf[:end]
-                if len(pkt) >= 4 and crc16_check(pkt):
-                    try:
-                        self.handle_incoming_data(sock, self.ip, pkt)
-                    except Exception as e:
-                        self.log_traceback('Unhandled exception in frame handler', e)
-                    del self._rxbuf[:end]
-                    found = True
-                    break
-
-            if not found:
-                break
 
     def prepare_socket(self):
         if self.sock is None:
@@ -215,7 +180,7 @@ class NeptunSocket:
                 self.owner.log(_error, res)
             self.last_activity = datetime.datetime.now()
 
-            # ← добавьте этот блок:
+            # Небольшой «hello» помогает первым запросам
             try:
                 time.sleep(0.1)
                 self.owner.send_reconnect()   # 0x57
@@ -307,7 +272,7 @@ class RequestSendPeriodically:
         self.method = method
         self.last_sent = None
         self.retry = 0
-        self.count = 0
+               self.count = 0
 
     def check_send(self, timeout = None, incCounter = True):
         """
@@ -365,8 +330,9 @@ class NeptunConnector(threading.Thread):
 
         self.log_prefix = '[' + ip + ']:'
 
-        # буфер входящего TCP-потока
+        # буфер для TCP-потока и флаг наличия имён счётчиков
         self._rxbuf = bytearray()
+        self.got_counter_names = False
 
         threading.Thread.__init__(self)
 
@@ -484,8 +450,8 @@ class NeptunConnector(threading.Thread):
         Извлекает из self._rxbuf один или несколько полных кадров и
         передаёт их в handle_incoming_data().
         Кадр:
-        - начинается с 0x02 0x54 (третий байт может быть разным: 'Q' или 'A')
-        - заканчивается корректным CRC16 (последние 2 байта)
+          - начинается с 0x02 0x54 (третий байт может быть разным: 'Q' или 'A')
+          - заканчивается корректным CRC16 (последние 2 байта)
         """
         START2 = b'\x02\x54'
         while True:
@@ -557,7 +523,7 @@ class NeptunConnector(threading.Thread):
                     self._rxbuf += data
                     self._process_rxbuf(self.socket)
             return True
-        
+
         except socket.timeout as e:
             pass
 
@@ -576,10 +542,7 @@ class NeptunConnector(threading.Thread):
         """
         Handle an incoming data packet (control checksum, decode to a readable format)
         """
-        #if len(data) < 4:
-        #    # self.log("Invalid length of a data packet")
-        #    return False
-
+        # сюда попадают «цельные» кадры из _process_rxbuf (для UDP — целые датаграммы)
         if not crc16_check(data):
             self.log("Invalid checksum of a data packet")
             return False
@@ -627,7 +590,7 @@ class NeptunConnector(threading.Thread):
                         tag_size = data[offset] * 0x100 + data[offset + 1]
                         offset += 2
                         offset2 = offset
-                        if tag == 73:  # 0x 49
+                        if tag == 73:  # 0x49
                             # type and version
                             self.device['type'] = chr(data[offset2]) + chr(data[offset2+1])
                             offset2 += 2
@@ -685,16 +648,20 @@ class NeptunConnector(threading.Thread):
 
                         offset += tag_size
 
+                    # начинаем цепочку запросов
+                    self.got_counter_names = False
                     self.send_get_counter_names()
 
                 elif packet_type == PACKET_COUNTER_NAME:
                     # counter name response
+                    self.got_counter_names = True
                     offset = 4
                     tag_size = data[offset] * 0x100 + data[offset + 1]
                     offset += 2
                     str_data = data[offset:]
                     sensor_names = str_data.split(b'\x00')
-                    sensor_names.pop(-1)
+                    if len(sensor_names) and sensor_names[-1] == b'':
+                        sensor_names.pop(-1)
                     idx = 0
                     mode = self.device['line_in_config']
                     mask = 1
@@ -714,7 +681,6 @@ class NeptunConnector(threading.Thread):
 
                 elif packet_type == PACKET_COUNTER_STATE:
                     # counter value response
-
                     offset = 4
                     tag_size = data[offset] * 0x100 + data[offset + 1]
                     offset += 2
@@ -722,7 +688,7 @@ class NeptunConnector(threading.Thread):
                     idx = 0
                     while(offset < data_len):
                         sensor_info = self.get_line_info(idx)
-                        # FIX: корректное чтение 4 байтов BE
+                        # корректное чтение 4 байт BE
                         value = (data[offset]   << 24) + \
                                 (data[offset+1] << 16) + \
                                 (data[offset+2] <<  8) + \
@@ -730,7 +696,6 @@ class NeptunConnector(threading.Thread):
                         sensor_info['value'] = value
                         sensor_info['step'] = data[offset + 4]
                         self.set_line_info(idx, sensor_info)
-                        # self.log('Wired sensor or counter:', sensor_info)
                         offset += 5
                         idx += 1
 
@@ -743,7 +708,8 @@ class NeptunConnector(threading.Thread):
                     offset += 2
                     str_data = data[offset:]
                     sensor_names = str_data.split(b'\x00')
-                    sensor_names.pop(-1)
+                    if len(sensor_names) and sensor_names[-1] == b'':
+                        sensor_names.pop(-1)
                     idx = 4
                     for sensor_name in sensor_names:
                         sensor_info = self.get_line_info(idx)
@@ -770,7 +736,6 @@ class NeptunConnector(threading.Thread):
                         sensor_info['battery'] = data[offset + 2]
                         sensor_info['state'] = data[offset + 3]
                         self.set_line_info(idx, sensor_info)
-                        # self.log('Wireless sensor:', sensor_info)
                         offset += 4
                         idx += 1
 
@@ -784,7 +749,15 @@ class NeptunConnector(threading.Thread):
                         self.device['status'] = data[offset]
                         self.device['status_name'] = self.decode_status(data[offset])
 
-                try:                
+                elif packet_type == PACKET_ACK:
+                    # Короткий ACK/keepalive. Если счётчиков нет — запросим имена датчиков.
+                    if not self.got_counter_names:
+                        try:
+                            self.send_get_sensor_names()
+                        except Exception as e:
+                            self.log_traceback('Failed to request sensor names after ACK', e)
+
+                try:
                     self.data_callback(self, sock, ip, callback_data)
                 except Exception as e:
                     self.log_traceback('Unhandled exception id data_callback', e)
@@ -892,7 +865,7 @@ class NeptunConnector(threading.Thread):
         """
         data = bytearray([2, 84, 81, PACKET_SYSTEM_STATE, 0, 0])
         data = crc16_append(data)
-        self.send_command(data, self.ip, self.port, 30)
+        self.send_command(data, self.ip, self.port, 30)  # увеличенный таймаут
         return self
 
     def send_get_background_status(self):
