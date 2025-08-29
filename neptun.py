@@ -272,7 +272,7 @@ class RequestSendPeriodically:
         self.method = method
         self.last_sent = None
         self.retry = 0
-               self.count = 0
+        self.count = 0
 
     def check_send(self, timeout = None, incCounter = True):
         """
