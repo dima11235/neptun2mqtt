@@ -1,5 +1,5 @@
-print("### NEPTUN.PY BUILD: 2025-08-29-LEN-FRAMING ###")
-print("### NEPTUN.PY BUILD: 2025-08-29-LEN-FRAMING ###")
+print("### NEPTUN.PY BUILD: 2025-08-29-LEN-FRAMING-RETRY ###")
+print("### NEPTUN.PY BUILD: 2025-08-29-LEN-FRAMING-RETRY ###")
 
 from six import string_types
 import sys, traceback
@@ -33,7 +33,8 @@ PACKET_SENSOR_STATE = 0x53
 PACKET_BACK_STATE = 0x42
 PACKET_RECONNECT = 0x57
 PACKET_SET_SYSTEM_STATE = 0x57
-PACKET_ACK = 0xFB  # короткий ACK/keepalive
+PACKET_ACK = 0xFB          # короткий ACK/keepalive
+PACKET_BUSY = 0xFE         # “занят/повтори позже”
 
 BROADCAST_PORT = 6350
 BROADCAST_ADDRESS = '255.255.255.255'
@@ -337,6 +338,13 @@ class NeptunConnector(threading.Thread):
         self._rxbuf = bytearray()
         self.got_counter_names = False
 
+        # состояние «ожидаемого» ответа (для мягких ретраев)
+        self._pending = None
+        self._pending_sent = None
+        self._pending_retries = 0
+        self._pending_retry_timeout = 1.0
+        self._pending_max_retries = 5
+
         threading.Thread.__init__(self)
 
     def terminate(self):
@@ -448,53 +456,76 @@ class NeptunConnector(threading.Thread):
             s.append('SENSOR OFFLINE')
         return ','.join(s)
 
+    # ------------------- ВСПОМОГАТЕЛЬНОЕ ДЛЯ PENDING -------------------
+
+    def _set_pending(self, pkt_type, retry_timeout=1.0):
+        self._pending = pkt_type
+        self._pending_sent = datetime.datetime.now()
+        self._pending_retries = 0
+        self._pending_retry_timeout = retry_timeout
+
+    def _clear_pending(self):
+        self._pending = None
+        self._pending_sent = None
+        self._pending_retries = 0
+
+    def _retry_pending_if_needed(self):
+        if self._pending is None or self._pending_sent is None:
+            return
+        if time_delta(self._pending_sent) < self._pending_retry_timeout:
+            return
+        if self._pending_retries >= self._pending_max_retries:
+            self.log('Too many retries, giving up pending request')
+            self._clear_pending()
+            return
+        # повторяем тот же запрос
+        self._pending_retries += 1
+        if self._pending == PACKET_COUNTER_NAME:
+            self._raw_send_counter_names()
+        elif self._pending == PACKET_COUNTER_STATE:
+            self._raw_send_counter_value()
+        elif self._pending == PACKET_SENSOR_NAME:
+            self._raw_send_sensor_names()
+        elif self._pending == PACKET_SENSOR_STATE:
+            self._raw_send_sensor_state()
+        else:
+            # на всякий случай сброс
+            self._clear_pending()
+            return
+        self._pending_sent = datetime.datetime.now()
+
+    # ------------------- TCP разбор по длине -------------------
 
     def _process_rxbuf(self, sock):
         """
         Разбор TCP-потока по полю длины.
         Кадр имеет формат:
         0x02 0x54 <dir> <type> <len_hi> <len_lo> <payload:[len]> <crc_hi> <crc_lo>
-
-        где:
-        - первые 2 байта: сигнатура (0x02, 0x54)
-        - <dir>: направление/маркер ('Q' или 'A' и т.п.)
-        - <type>: тип пакета (например 0x52, 0x63, 0x43, 0x4E, 0x53, 0xFB)
-        - <len_hi><len_lo>: длина полезной нагрузки (big-endian)
-        - далее payload указанной длины
-        - в конце 2 байта CRC16 по всему кадру без последних 2 байт
         """
         START2 = b'\x02\x54'
 
         while True:
-            # ищем префикс кадра
             i = self._rxbuf.find(START2)
             if i == -1:
-                # нет даже префикса — оставим 1 байт (вдруг это 0x02) на стыке
                 if len(self._rxbuf) > 1:
                     del self._rxbuf[:-1]
                 break
 
-            # отбрасываем мусор до префикса
             if i > 0:
                 del self._rxbuf[:i]
 
-            # ждём минимум 6 байт заголовка
             if len(self._rxbuf) < 6:
                 break
 
-            # читаем длину полезной нагрузки
             payload_len = (self._rxbuf[4] << 8) | self._rxbuf[5]
-            total_len = 6 + payload_len + 2  # header(6) + payload + CRC(2)
+            total_len = 6 + payload_len + 2  # header + payload + CRC16
 
-            # ждём, пока накопится весь кадр
             if len(self._rxbuf) < total_len:
                 break
 
-            # вырезаем полный кадр
             frame = bytes(self._rxbuf[:total_len])
             del self._rxbuf[:total_len]
 
-            # проверяем CRC и отдаём дальше
             try:
                 if not crc16_check(frame):
                     self.log("Invalid checksum of a data packet")
@@ -502,8 +533,8 @@ class NeptunConnector(threading.Thread):
                 self.handle_incoming_data(sock, self.ip, frame)
             except Exception as e:
                 self.log_traceback('Unhandled exception in frame handler', e)
-                # продолжаем парсить следующие кадры
 
+    # ------------------- Приём/цикл -------------------
 
     def check_incoming(self):
         """
@@ -553,6 +584,8 @@ class NeptunConnector(threading.Thread):
         except Exception as e:
             self.log_traceback("Can't incoming data %r" % (data if 'data' in locals() else None), e)
             raise
+
+    # ------------------- Декодирование пакетов -------------------
 
     def handle_incoming_data(self, sock, ip, data):
         """
@@ -645,10 +678,13 @@ class NeptunConnector(threading.Thread):
 
                         offset += tag_size
 
+                    # старт цепочки с учётом pending/ретраев
                     self.got_counter_names = False
-                    self.send_get_counter_names()
+                    self._send_with_pending(PACKET_COUNTER_NAME, self._raw_send_counter_names, retry_timeout=1.0)
 
                 elif packet_type == PACKET_COUNTER_NAME:
+                    # получили ожидаемый ответ — очистим pending и продолжим цепочку
+                    self._clear_pending()
                     self.got_counter_names = True
                     offset = 4
                     tag_size = data[offset] * 0x100 + data[offset + 1]
@@ -672,9 +708,10 @@ class NeptunConnector(threading.Thread):
                         self.set_line_info(idx, sensor_info)
                         idx += 1
 
-                    self.send_get_counter_value()
+                    self._send_with_pending(PACKET_COUNTER_STATE, self._raw_send_counter_value, retry_timeout=1.0)
 
                 elif packet_type == PACKET_COUNTER_STATE:
+                    self._clear_pending()
                     offset = 4
                     tag_size = data[offset] * 0x100 + data[offset + 1]
                     offset += 2
@@ -692,9 +729,10 @@ class NeptunConnector(threading.Thread):
                         offset += 5
                         idx += 1
 
-                    self.send_get_sensor_names()
+                    self._send_with_pending(PACKET_SENSOR_NAME, self._raw_send_sensor_names, retry_timeout=1.0)
 
                 elif packet_type == PACKET_SENSOR_NAME:
+                    self._clear_pending()
                     offset = 4
                     tag_size = data[offset] * 0x100 + data[offset + 1]
                     offset += 2
@@ -711,9 +749,10 @@ class NeptunConnector(threading.Thread):
                         self.set_line_info(idx, sensor_info)
                         idx += 1
 
-                    self.send_get_sensor_state()
+                    self._send_with_pending(PACKET_SENSOR_STATE, self._raw_send_sensor_state, retry_timeout=1.0)
 
                 elif packet_type == PACKET_SENSOR_STATE:
+                    self._clear_pending()
                     self.last_state_updated = datetime.datetime.now()
                     offset = 4
                     tag_size = data[offset] * 0x100 + data[offset + 1]
@@ -739,12 +778,9 @@ class NeptunConnector(threading.Thread):
                         self.device['status'] = data[offset]
                         self.device['status_name'] = self.decode_status(data[offset])
 
-                elif packet_type == PACKET_ACK:
-                    if not self.got_counter_names:
-                        try:
-                            self.send_get_sensor_names()
-                        except Exception as e:
-                            self.log_traceback('Failed to request sensor names after ACK', e)
+                elif packet_type in (PACKET_ACK, PACKET_BUSY):
+                    # устройство занято — повторим последний «значимый» запрос
+                    self._retry_pending_if_needed()
 
                 try:
                     self.data_callback(self, sock, ip, callback_data)
@@ -755,6 +791,8 @@ class NeptunConnector(threading.Thread):
             self.log_traceback('Unhandled exception', e)
 
         return True
+
+    # ------------------- Очередь отправки -------------------
 
     def send_from_queue(self):
         """
@@ -791,6 +829,36 @@ class NeptunConnector(threading.Thread):
         self.log("++Q (" + ip + ':' + str(port) + ") :", data)
         self.command_queue.put({'data': data, 'ip': ip, 'port': port, 'timeout': timeout})
 
+    # ------------------- НИЗКОУРОВНЕВЫЕ (“raw”) -------------------
+
+    def _raw_send_counter_names(self):
+        data = bytearray([2, 84, 81, PACKET_COUNTER_NAME, 0, 0])
+        data = crc16_append(data)
+        self.send_command(data, self.ip, self.port, 5)
+
+    def _raw_send_counter_value(self):
+        data = bytearray([2, 84, 81, PACKET_COUNTER_STATE, 0, 0])
+        data = crc16_append(data)
+        self.send_command(data, self.ip, self.port, 5)
+
+    def _raw_send_sensor_names(self):
+        data = bytearray([2, 84, 81, PACKET_SENSOR_NAME, 0, 0])
+        data = crc16_append(data)
+        self.send_command(data, self.ip, self.port, 5)
+
+    def _raw_send_sensor_state(self):
+        data = bytearray([2, 84, 81, PACKET_SENSOR_STATE, 0, 0])
+        data = crc16_append(data)
+        self.send_command(data, self.ip, self.port, 5)
+
+    # ------------------- ВЫСОКОУРОВНЕВЫЕ (с pending) -------------------
+
+    def _send_with_pending(self, pkt_type, builder_fn, retry_timeout=1.0):
+        builder_fn()
+        self._set_pending(pkt_type, retry_timeout)
+
+    # ------------------- Публичные методы (интерфейс для neptun2mqtt.py) -------------------
+
     def send_whois(self):
         """
         Whois command: for the  broadcast (UDP) connector only.
@@ -812,39 +880,20 @@ class NeptunConnector(threading.Thread):
         return self
 
     def send_get_counter_names(self):
-        """
-        Get counter or wired sensor names.
-        """
-        data = bytearray([2, 84, 81, PACKET_COUNTER_NAME, 0, 0])
-        data = crc16_append(data)
-        self.send_command(data, self.ip, self.port, 5)
+        # оставлено для внешних вызовов, внутри логики используем _send_with_pending
+        self._send_with_pending(PACKET_COUNTER_NAME, self._raw_send_counter_names, retry_timeout=1.0)
         return self
 
     def send_get_counter_value(self):
-        """
-        Get counter values.
-        """
-        data = bytearray([2, 84, 81, PACKET_COUNTER_STATE, 0, 0])
-        data = crc16_append(data)
-        self.send_command(data, self.ip, self.port, 5)
+        self._send_with_pending(PACKET_COUNTER_STATE, self._raw_send_counter_value, retry_timeout=1.0)
         return self
 
     def send_get_sensor_names(self):
-        """
-        Get wireless sensor names.
-        """
-        data = bytearray([2, 84, 81, PACKET_SENSOR_NAME, 0, 0])
-        data = crc16_append(data)
-        self.send_command(data, self.ip, self.port, 5)
+        self._send_with_pending(PACKET_SENSOR_NAME, self._raw_send_sensor_names, retry_timeout=1.0)
         return self
 
     def send_get_sensor_state(self):
-        """
-        Get wireless sensor info and state.
-        """
-        data = bytearray([2, 84, 81, PACKET_SENSOR_STATE, 0, 0])
-        data = crc16_append(data)
-        self.send_command(data, self.ip, self.port, 5)
+        self._send_with_pending(PACKET_SENSOR_STATE, self._raw_send_sensor_state, retry_timeout=1.0)
         return self
 
     def send_get_system_state(self):
@@ -854,6 +903,7 @@ class NeptunConnector(threading.Thread):
         data = bytearray([2, 84, 81, PACKET_SYSTEM_STATE, 0, 0])
         data = crc16_append(data)
         self.send_command(data, self.ip, self.port, 30)  # увеличенный таймаут
+        # SYSTEM_STATE не добавляем в pending — ответ приходит сразу, а дальше начнётся цепочка
         return self
 
     def send_get_background_status(self):
