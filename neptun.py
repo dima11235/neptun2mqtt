@@ -332,6 +332,8 @@ class NeptunConnector(threading.Thread):
         self.last_state_updated = None
         self.state_update_interval = 120 # poll the device with this interval is seconds
 
+        self.log_prefix = '[' + ip + ']:'  # <-- исправлено ниже; эта строка была ошибочной
+        # Правильная версия:
         self.log_prefix = '[' + ip + ']:'
 
         # буфер для TCP-потока и флаг наличия имён счётчиков
@@ -478,6 +480,7 @@ class NeptunConnector(threading.Thread):
             self.log('Too many retries, giving up pending request')
             self._clear_pending()
             return
+
         # повторяем тот же запрос
         self._pending_retries += 1
         if self._pending == PACKET_COUNTER_NAME:
@@ -492,6 +495,9 @@ class NeptunConnector(threading.Thread):
             # на всякий случай сброс
             self._clear_pending()
             return
+
+        # экспоненциальный backoff (до 8 секунд)
+        self._pending_retry_timeout = min(self._pending_retry_timeout * 2.0, 8.0)
         self._pending_sent = datetime.datetime.now()
 
     # ------------------- TCP разбор по длине -------------------
@@ -564,15 +570,21 @@ class NeptunConnector(threading.Thread):
                 else:
                     data = self.socket.sock.recv(SOCKET_BUFSIZE)
                     if not data:
+                        # даже если данных нет — проверим ретраи pending
+                        self._retry_pending_if_needed()
                         return True
                     if self.debug_mode > 1:
                         self.log('<--', self.ip, ":", self._formatBuffer(data))
                     self._rxbuf += data
                     self._process_rxbuf(self.socket)
+
+            # проверяем ретраи после обработки входящих пакетов
+            self._retry_pending_if_needed()
             return True
 
         except socket.timeout as e:
-            pass
+            # по таймауту чтения тоже проверим ретраи
+            self._retry_pending_if_needed()
 
         except socket.error as e:
             if e.errno == errno.ECONNRESET:
@@ -779,8 +791,8 @@ class NeptunConnector(threading.Thread):
                         self.device['status_name'] = self.decode_status(data[offset])
 
                 elif packet_type in (PACKET_ACK, PACKET_BUSY):
-                    # устройство занято — повторим последний «значимый» запрос
-                    self._retry_pending_if_needed()
+                    # просто игнорируем «служебные» короткие ответы
+                    pass
 
                 try:
                     self.data_callback(self, sock, ip, callback_data)
