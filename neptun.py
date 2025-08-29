@@ -119,8 +119,10 @@ class NeptunSocket:
             pass
 
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFSIZE)
-        # НЕ биндим локальный порт для клиентского TCP:
-        # sock.bind(('', self.port))
+        
+        # ВАЖНО: для Neptun оставляем фикс исходного порта 6350
+        sock.bind(('', self.port))
+
         return sock
 
     def _prepare_socket_udp(self):
