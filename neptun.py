@@ -1,3 +1,5 @@
+print("### NEPTUN.PY BUILD: 2025-08-29-LEN-FRAMING ###")
+
 from six import string_types
 import sys, traceback
 import os
@@ -445,43 +447,62 @@ class NeptunConnector(threading.Thread):
             s.append('SENSOR OFFLINE')
         return ','.join(s)
 
+
     def _process_rxbuf(self, sock):
         """
-        Извлекает из self._rxbuf один или несколько полных кадров и
-        передаёт их в handle_incoming_data().
-        Кадр:
-          - начинается с 0x02 0x54 (третий байт может быть разным: 'Q' или 'A')
-          - заканчивается корректным CRC16 (последние 2 байта)
+        Разбор TCP-потока по полю длины.
+        Кадр имеет формат:
+        0x02 0x54 <dir> <type> <len_hi> <len_lo> <payload:[len]> <crc_hi> <crc_lo>
+
+        где:
+        - первые 2 байта: сигнатура (0x02, 0x54)
+        - <dir>: направление/маркер ('Q' или 'A' и т.п.)
+        - <type>: тип пакета (например 0x52, 0x63, 0x43, 0x4E, 0x53, 0xFB)
+        - <len_hi><len_lo>: длина полезной нагрузки (big-endian)
+        - далее payload указанной длины
+        - в конце 2 байта CRC16 по всему кадру без последних 2 байт
         """
         START2 = b'\x02\x54'
+
         while True:
+            # ищем префикс кадра
             i = self._rxbuf.find(START2)
             if i == -1:
+                # нет даже префикса — оставим 1 байт (вдруг это 0x02) на стыке
                 if len(self._rxbuf) > 1:
                     del self._rxbuf[:-1]
                 break
+
+            # отбрасываем мусор до префикса
             if i > 0:
                 del self._rxbuf[:i]
 
+            # ждём минимум 6 байт заголовка
             if len(self._rxbuf) < 6:
                 break
 
-            found = False
-            max_len = min(len(self._rxbuf), 4096)
+            # читаем длину полезной нагрузки
+            payload_len = (self._rxbuf[4] << 8) | self._rxbuf[5]
+            total_len = 6 + payload_len + 2  # header(6) + payload + CRC(2)
 
-            for end in range(6, max_len + 1):
-                pkt = self._rxbuf[:end]
-                if len(pkt) >= 4 and crc16_check(pkt):
-                    try:
-                        self.handle_incoming_data(sock, self.ip, pkt)
-                    except Exception as e:
-                        self.log_traceback('Unhandled exception in frame handler', e)
-                    del self._rxbuf[:end]
-                    found = True
-                    break
-
-            if not found:
+            # ждём, пока накопится весь кадр
+            if len(self._rxbuf) < total_len:
                 break
+
+            # вырезаем полный кадр
+            frame = bytes(self._rxbuf[:total_len])
+            del self._rxbuf[:total_len]
+
+            # проверяем CRC и отдаём дальше
+            try:
+                if not crc16_check(frame):
+                    self.log("Invalid checksum of a data packet")
+                    continue
+                self.handle_incoming_data(sock, self.ip, frame)
+            except Exception as e:
+                self.log_traceback('Unhandled exception in frame handler', e)
+                # продолжаем парсить следующие кадры
+
 
     def check_incoming(self):
         """
