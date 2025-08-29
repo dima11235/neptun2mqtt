@@ -163,6 +163,30 @@ def prepare_mqtt(MQTT_SERVER, MQTT_PORT=1883):
     client = mqtt.Client()
     client.on_connect = on_connect
     client.on_message = on_message
+
+    # --- set MQTT auth from ini (supports username/user + password/pass) ---
+    try:
+        import configparser, os
+        cfg = configparser.ConfigParser()
+        ini_path = os.path.join(os.path.dirname(__file__), 'neptun2mqtt.ini')
+        cfg.read(ini_path)
+        sect = 'MQTT'
+        if cfg.has_section(sect):
+            def getkey(*keys):
+                for k in keys:
+                    if cfg.has_option(sect, k):
+                        v = cfg.get(sect, k).strip()
+                        if v != '':
+                            return v
+                return None
+            user = getkey('username', 'user')
+            pwd  = getkey('password', 'pass')
+            if user is not None:
+                client.username_pw_set(user, pwd or None)
+    except Exception as e:
+        log('WARN: could not set MQTT auth:', e)
+    # --- end auth block ---
+
     client.connect(MQTT_SERVER, MQTT_PORT, 60)
     return client
 
