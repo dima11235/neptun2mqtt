@@ -119,7 +119,7 @@ class NeptunSocket:
             pass
 
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFSIZE)
-        
+
         # ВАЖНО: для Neptun оставляем фикс исходного порта 6350
         sock.bind(('', self.port))
 
@@ -438,31 +438,35 @@ class NeptunConnector(threading.Thread):
     def _process_rxbuf(self, sock):
         """
         Извлекает из self._rxbuf один или несколько полных кадров и
-        передаёт их в handle_incoming_data(). Кадр:
-          - начинается с 0x02 0x54 0x51
-          - заканчивается корректным CRC16 (последние 2 байта)
+        передаёт их в handle_incoming_data().
+        Кадр:
+        - начинается с 0x02 0x54 (третий байт может быть разным: 'Q' или 'A')
+        - заканчивается корректным CRC16 (последние 2 байта)
         """
-        START = b'\x02\x54\x51'
+        START2 = b'\x02\x54'
         while True:
-            i = self._rxbuf.find(START)
+            # ищем начало по двум байтам
+            i = self._rxbuf.find(START2)
             if i == -1:
-                # нет префикса: держим последние 2 байта как «хвост»
-                if len(self._rxbuf) > 2:
-                    del self._rxbuf[:-2]
+                # нет даже префикса — оставим хвост из 1 байта (вдруг это 0x02)
+                if len(self._rxbuf) > 1:
+                    del self._rxbuf[:-1]
                 break
             if i > 0:
                 del self._rxbuf[:i]
 
+            # нам нужно минимум 6 байт (заголовок + CRC), иначе ждём
             if len(self._rxbuf) < 6:
-                # пока слишком коротко, ждём догрузки
                 break
 
             found = False
-            max_len = min(len(self._rxbuf), 2048)
+            # разумный предел длины кадра, чтобы не крутиться вечно
+            max_len = min(len(self._rxbuf), 4096)
+
+            # перебираем возможный конец кадра и проверяем CRC
             for end in range(6, max_len + 1):
                 pkt = self._rxbuf[:end]
                 if len(pkt) >= 4 and crc16_check(pkt):
-                    # полный кадр; передаём на разбор
                     try:
                         self.handle_incoming_data(sock, self.ip, pkt)
                     except Exception as e:
@@ -472,7 +476,7 @@ class NeptunConnector(threading.Thread):
                     break
 
             if not found:
-                # полного кадра пока нет
+                # полного кадра пока нет — ждём следующего чтения
                 break
 
     def check_incoming(self):
@@ -529,7 +533,7 @@ class NeptunConnector(threading.Thread):
         Handle an incoming data packet (control checksum, decode to a readable format)
         """
         if len(data) < 4:
-            self.log("Invalid length of a data packet")
+            # self.log("Invalid length of a data packet")
             return False
 
         if not crc16_check(data):
