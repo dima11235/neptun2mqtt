@@ -455,25 +455,20 @@ class NeptunConnector(threading.Thread):
         """
         START2 = b'\x02\x54'
         while True:
-            # ищем начало по двум байтам
             i = self._rxbuf.find(START2)
             if i == -1:
-                # нет даже префикса — оставим хвост из 1 байта (вдруг это 0x02)
                 if len(self._rxbuf) > 1:
                     del self._rxbuf[:-1]
                 break
             if i > 0:
                 del self._rxbuf[:i]
 
-            # нам нужно минимум 6 байт (заголовок + CRC), иначе ждём
             if len(self._rxbuf) < 6:
                 break
 
             found = False
-            # разумный предел длины кадра, чтобы не крутиться вечно
             max_len = min(len(self._rxbuf), 4096)
 
-            # перебираем возможный конец кадра и проверяем CRC
             for end in range(6, max_len + 1):
                 pkt = self._rxbuf[:end]
                 if len(pkt) >= 4 and crc16_check(pkt):
@@ -486,7 +481,6 @@ class NeptunConnector(threading.Thread):
                     break
 
             if not found:
-                # полного кадра пока нет — ждём следующего чтения
                 break
 
     def check_incoming(self):
@@ -517,7 +511,7 @@ class NeptunConnector(threading.Thread):
                 else:
                     data = self.socket.sock.recv(SOCKET_BUFSIZE)
                     if not data:
-                        return True  # пустое чтение — игнор
+                        return True
                     if self.debug_mode > 1:
                         self.log('<--', self.ip, ":", self._formatBuffer(data))
                     self._rxbuf += data
@@ -542,7 +536,6 @@ class NeptunConnector(threading.Thread):
         """
         Handle an incoming data packet (control checksum, decode to a readable format)
         """
-        # сюда попадают «цельные» кадры из _process_rxbuf (для UDP — целые датаграммы)
         if not crc16_check(data):
             self.log("Invalid checksum of a data packet")
             return False
@@ -550,7 +543,6 @@ class NeptunConnector(threading.Thread):
         callback_data = {}
         if sock.is_udp:
             if (data == sock.request_data):
-                # this is our request
                 return False
 
         try:
@@ -562,7 +554,7 @@ class NeptunConnector(threading.Thread):
             if self.data_callback is not None:
                 data = bytearray(data)
                 data_len = len(data) - 2
-                del data[data_len:]  # remove CRC
+                del data[data_len:]
                 packet_type = data[3]
 
                 callback_data['type'] = packet_type
@@ -581,7 +573,6 @@ class NeptunConnector(threading.Thread):
                         callback_data['mac'] = data
 
                 elif packet_type == PACKET_SYSTEM_STATE:
-                    # system state
                     self.device['lines'] = {}
                     offset = 6
                     while(offset < data_len):
@@ -591,55 +582,39 @@ class NeptunConnector(threading.Thread):
                         offset += 2
                         offset2 = offset
                         if tag == 73:  # 0x49
-                            # type and version
                             self.device['type'] = chr(data[offset2]) + chr(data[offset2+1])
                             offset2 += 2
                             self.device['version'] = chr(data[offset2]) + '.' + \
                                 chr(data[offset2+1]) + '.' + chr(data[offset2+2])
                         elif tag == 78:  # 0x4E
-                            # name
                             str_data = data[offset2:offset2+tag_size]
                             self.device['name'] = str_data.decode('ascii')
                         elif tag == 77:  # 0x4D
-                            # MAC
                             str_data = data[offset2:offset2+tag_size]
                             self.device['mac'] = str_data.decode('ascii')
                         elif tag == 65:  # 0x41
-                            # access
                             access = False
                             if (tag_size > 0) and (data[offset2] > 0):
                                 access = True
                             self.device['access'] = access
                         elif tag == 83:  # 0x53
-                            # main valve state: open/closed
                             self._update_timestamp()
                             self.device['valve_state_open'] = data[offset2] == 1
                             offset2 += 1
-                            # number of wireless sensors
                             self.device['sensor_count'] = data[offset2]
                             offset2 += 1
                             self.device['relay_count'] = data[offset2]
                             offset2 += 1
-                            # cleaning mode (ignore sensors alarms)
                             self.device['flag_dry'] = data[offset2] == 1
                             offset2 += 1
-                            # close valve is wireless sensors are offline
                             self.device['flag_cl_valve'] = data[offset2] == 1
                             offset2 += 1
-                            # wired line mode: sensor/counter (bit mask)
                             self.device['line_in_config'] = data[offset2]
                             offset2 += 1
-                            # bitmask
-                            # 0x00 - no events (normal mode)
-                            # 0x01 - alarm
-                            # 0x02 - battery on main module is low
-                            # 0x04 - battery on sensor is low
-                            # 0x08 - sensor (offline)
                             self.device['status'] = data[offset2]
                             self.device['status_name'] = self.decode_status(data[offset2])
 
                         elif tag == 115:  # 0x73
-                            # state of wired lines
                             for idx in range(4):
                                 sensor_info = self.get_line_info(idx)
                                 sensor_info['state'] = data[offset2]
@@ -648,12 +623,10 @@ class NeptunConnector(threading.Thread):
 
                         offset += tag_size
 
-                    # начинаем цепочку запросов
                     self.got_counter_names = False
                     self.send_get_counter_names()
 
                 elif packet_type == PACKET_COUNTER_NAME:
-                    # counter name response
                     self.got_counter_names = True
                     offset = 4
                     tag_size = data[offset] * 0x100 + data[offset + 1]
@@ -680,7 +653,6 @@ class NeptunConnector(threading.Thread):
                     self.send_get_counter_value()
 
                 elif packet_type == PACKET_COUNTER_STATE:
-                    # counter value response
                     offset = 4
                     tag_size = data[offset] * 0x100 + data[offset + 1]
                     offset += 2
@@ -688,7 +660,6 @@ class NeptunConnector(threading.Thread):
                     idx = 0
                     while(offset < data_len):
                         sensor_info = self.get_line_info(idx)
-                        # корректное чтение 4 байт BE
                         value = (data[offset]   << 24) + \
                                 (data[offset+1] << 16) + \
                                 (data[offset+2] <<  8) + \
@@ -702,7 +673,6 @@ class NeptunConnector(threading.Thread):
                     self.send_get_sensor_names()
 
                 elif packet_type == PACKET_SENSOR_NAME:
-                    # sensor names response
                     offset = 4
                     tag_size = data[offset] * 0x100 + data[offset + 1]
                     offset += 2
@@ -722,7 +692,6 @@ class NeptunConnector(threading.Thread):
                     self.send_get_sensor_state()
 
                 elif packet_type == PACKET_SENSOR_STATE:
-                    # sensor state response
                     self.last_state_updated = datetime.datetime.now()
                     offset = 4
                     tag_size = data[offset] * 0x100 + data[offset + 1]
@@ -740,7 +709,6 @@ class NeptunConnector(threading.Thread):
                         idx += 1
 
                 elif packet_type == PACKET_BACK_STATE:
-                    # background status
                     offset = 4
                     tag_size = data[offset] * 0x100 + data[offset + 1]
                     offset += 2
@@ -750,7 +718,6 @@ class NeptunConnector(threading.Thread):
                         self.device['status_name'] = self.decode_status(data[offset])
 
                 elif packet_type == PACKET_ACK:
-                    # Короткий ACK/keepalive. Если счётчиков нет — запросим имена датчиков.
                     if not self.got_counter_names:
                         try:
                             self.send_get_sensor_names()
@@ -793,7 +760,6 @@ class NeptunConnector(threading.Thread):
             except:
                 self.log(_error)
 
-            # signals to queue job is done
             self.command_queue.task_done()
 
     def send_command(self, data, ip, port, timeout):
