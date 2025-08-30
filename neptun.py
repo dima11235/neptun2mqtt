@@ -1,5 +1,4 @@
-print("### NEPTUN.PY BUILD: 2025-08-29-LEN-FRAMING-NO-RECONNECT ###")
-print("### NEPTUN.PY BUILD: 2025-08-29-LEN-FRAMING-NO-RECONNECT ###")
+print("### NEPTUN.PY BUILD: 2025-08-29-FW2_2-LEN-FRAMING-RETRY ###")
 
 from six import string_types
 import sys, traceback
@@ -34,7 +33,7 @@ PACKET_BACK_STATE = 0x42
 PACKET_RECONNECT = 0x57
 PACKET_SET_SYSTEM_STATE = 0x57
 PACKET_ACK = 0xFB          # короткий ACK/keepalive
-PACKET_BUSY = 0xFE         # «занят/повтори позже»
+PACKET_BUSY = 0xFE         # “занят/повтори позже”
 
 BROADCAST_PORT = 6350
 BROADCAST_ADDRESS = '255.255.255.255'
@@ -50,11 +49,10 @@ def time_delta(timestamp):
     else:
         return (datetime.datetime.now() - timestamp).total_seconds()
 
-
 def crc16(data, data_len=0):
-    """
-    CRC16 (CCITT, poly 0x1021, init 0xFFFF), big-endian
-    """
+    '''
+    CRC16
+    '''
     polynom = 0x1021
     crc16ret = 0xFFFF
     if data_len > 0:
@@ -84,6 +82,7 @@ def crc16_check(data):
 
 
 def crc16_append(data):
+    i = len(data)
     (crc_hi, crc_lo) = crc16(data)
     return data + bytearray([crc_hi, crc_lo])
 
@@ -91,6 +90,7 @@ def crc16_append(data):
 class NeptunSocket:
 
     def __init__(self, owner, type=socket.SOCK_STREAM, port=SERVER_PORT):
+
         self.owner = owner
         self.sock = None
         self.is_udp = type == socket.SOCK_DGRAM
@@ -110,6 +110,7 @@ class NeptunSocket:
                 self.sock = self._prepare_socket_udp()
             else:
                 self.sock = self._prepare_socket_tcp()
+
         return self.sock
 
     def _prepare_socket_tcp(self):
@@ -120,9 +121,12 @@ class NeptunSocket:
             sock.settimeout(1)
         except AttributeError:
             pass
+
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFSIZE)
-        # фикс исходного порта 6350
+
+        # ВАЖНО: для Neptun оставляем фикс исходного порта 6350
         sock.bind(('', self.port))
+
         return sock
 
     def _prepare_socket_udp(self):
@@ -133,17 +137,31 @@ class NeptunSocket:
             sock.settimeout(1)
         except AttributeError:
             pass
+
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_BUFSIZE)
         sock.bind(('', BROADCAST_PORT))
+
         return sock
 
     def _set_keepalive_linux(self, after_idle_sec=1, interval_sec=3, max_fails=5):
+        """Set TCP keepalive on an open socket.
+
+        It activates after 1 second (after_idle_sec) of idleness,
+        then sends a keepalive ping once every 3 seconds (interval_sec),
+        and closes the connection after 5 failed ping (max_fails), or 15 seconds
+        """
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, after_idle_sec)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, interval_sec)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, max_fails)
 
     def _set_keepalive_windows(self, after_idle_sec=1, interval_sec=3, max_fails=5):
+        """Set TCP keepalive on an open socket.
+
+        It activates after 1 second (after_idle_sec) of idleness,
+        then sends a keepalive ping once every 3 seconds (interval_sec),
+        and closes the connection after 5 failed ping (max_fails), or 15 seconds
+        """
         self.sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, interval_sec * (max_fails + 1) * 1000, interval_sec * 1000))
 
     def _connect(self, address):
@@ -165,7 +183,13 @@ class NeptunSocket:
                 self.owner.log(_error, res)
             self.last_activity = datetime.datetime.now()
 
-            # ВАЖНО: убрали send_reconnect() сразу после коннекта — он вызывал ответ FE (BUSY)
+            # Небольшой «hello» помогает первым запросам
+            try:
+                time.sleep(0.1)
+                self.owner.send_reconnect()   # 0x57
+                time.sleep(0.1)
+            except Exception as e:
+                self.owner.log_traceback("Post-connect hello failed", e)
 
             if not self.is_udp:
                 if (os.name == "posix"):
@@ -217,7 +241,7 @@ class NeptunSocket:
                 self.owner.log("--> (" + addr + ':' + str(port) + "):", self.owner._formatBuffer(data))
 
             if self.is_udp:
-                self.sock.sendto(data, (addr, port))
+               self.sock.sendto(data, (addr, port))
             else:
                 res = self.sock.send(data)
                 if res <= 0:
@@ -245,6 +269,7 @@ class NeptunSocket:
 
 class RequestSendPeriodically:
     def __init__(self, owner, timeout, method):
+        """Initialize the connector."""
         self.owner = owner
         self.timeout = timeout
         self.method = method
@@ -252,15 +277,26 @@ class RequestSendPeriodically:
         self.retry = 0
         self.count = 0
 
-    def check_send(self, timeout=None, incCounter=True):
+    def check_send(self, timeout = None, incCounter = True):
+        """
+        Checks and sends a next request after the specified timeout.
+        """
+
         if self.owner.socket is None:
             return False
 
         if self.owner.socket.wait_response:
             return False
 
-        timeout_ = self.timeout if timeout is None else timeout
-        diff = (self.timeout + 1) if (self.last_sent is None) else time_delta(self.last_sent)
+        if timeout is None:
+            timeout_ = self.timeout
+        else:
+            timeout_ = timeout
+
+        if self.last_sent is None:
+            diff = timeout_ + 1
+        else:
+            diff = time_delta(self.last_sent)
 
         if diff >= timeout_:
             self.last_sent = datetime.datetime.now()
@@ -270,12 +306,14 @@ class RequestSendPeriodically:
             return True
         return False
 
-
 class NeptunConnector(threading.Thread):
-    SEND_WHOIS_TIMEOUT = 300
-    SEND_HEARTBEAT_TIMEOUT = 300
+    """Connector for the Xiaomi Mi Hub and devices on multicast."""
+
+    SEND_WHOIS_TIMEOUT = 300  # resend whois request every 5 minues (0 - do not resend)
+    SEND_HEARTBEAT_TIMEOUT = 300  # send heartbeat packets (0 - do not resend)
 
     def __init__(self, ip, port=SERVER_PORT, data_callback=None, log_callback=None, debug_mode=0):
+        """Initialize the connector."""
         self.ip = ip
         self.port = port
         self.debug_mode = debug_mode
@@ -289,17 +327,17 @@ class NeptunConnector(threading.Thread):
         self.terminated = False
         self.socket = None
 
-        self.command_signal = 0
+        self.command_signal = 0 # used by a higher level
         self.last_state_updated = None
-        self.state_update_interval = 120
+        self.state_update_interval = 120 # poll the device with this interval is seconds
 
         self.log_prefix = '[' + ip + ']:'
 
-        # буфер TCP и признаки цепочки
+        # буфер для TCP-потока и флаг наличия имён счётчиков
         self._rxbuf = bytearray()
         self.got_counter_names = False
 
-        # «ожидаемый» ответ (для ретраев)
+        # состояние «ожидаемого» ответа (для мягких ретраев)
         self._pending = None
         self._pending_sent = None
         self._pending_retries = 0
@@ -309,10 +347,16 @@ class NeptunConnector(threading.Thread):
         threading.Thread.__init__(self)
 
     def terminate(self):
+        """
+        Signal the thread to terminate.
+        """
         self.terminated = True
         self.command_queue.put(None)
 
     def run(self):
+        """
+        Thread loop.
+        """
         self.log('Thread started')
 
         if self.ip == BROADCAST_ADDRESS:
@@ -326,6 +370,9 @@ class NeptunConnector(threading.Thread):
             except Exception as e:
                 if self.debug_mode > 1:
                     self.log_traceback("Error in connector's thread", e)
+            except:
+                if self.debug_mode > 1:
+                    self.log("Error in connector's thread")
             time.sleep(0.5)
 
         if self.socket is not None:
@@ -334,14 +381,17 @@ class NeptunConnector(threading.Thread):
         self.log('Thread terminated')
 
     def _formatBuffer(self, data: bytes):
+        """
+        Format a buffer to readable format.
+        """
         res = ""
         cnt = 0
         for n in data:
-            res += format(n, '02X') + ' '
-            cnt += 1
+            res = res + format(n, '02X') + ' '
+            cnt = cnt + 1
             if cnt >= 32:
                 cnt = 0
-                res += "\n"
+                res = res + "\n"
         return res
 
     def _update_timestamp(self, *args):
@@ -358,6 +408,9 @@ class NeptunConnector(threading.Thread):
         return
 
     def log_traceback(self, message, ex, ex_traceback=None):
+        """
+        Log detailed call stack for exceptions.
+        """
         if self.debug_mode:
             if ex_traceback is None:
                 ex_traceback = ex.__traceback__
@@ -366,33 +419,43 @@ class NeptunConnector(threading.Thread):
             self.log(message + ':', tb_lines)
         else:
             self.log(message + ':', ex)
+
         return
 
     def get_line_info(self, idx):
+        """
+        Get an information set for the specified line index.
+        """
         line_id = 'line' + str(idx)
         if line_id not in self.device['lines']:
             self.device['lines'][line_id] = {}
         return self.device['lines'][line_id]
 
     def set_line_info(self, idx, info):
+        """
+        Set an information set for the specified line index.
+        """
         line_id = 'line' + str(idx)
         self.device['lines'][line_id] = info
 
     def decode_status(self, status):
-        if status == 0x00:
+        """
+        Decode status bit mask to a string.
+        """
+        if(status == 0x00):
             return 'NORMAL'
         s = []
-        if status & 0x01:
+        if(status & 0x01):
             s.append('ALARM')
-        if status & 0x02:
+        if(status & 0x02):
             s.append('MAIN BATTERY')
-        if status & 0x04:
+        if(status & 0x04):
             s.append('SENSOR BATTERY')
-        if status & 0x08:
+        if(status & 0x08):
             s.append('SENSOR OFFLINE')
         return ','.join(s)
 
-    # ------------------- Pending / Retry helpers -------------------
+    # ------------------- ВСПОМОГАТЕЛЬНОЕ ДЛЯ PENDING -------------------
 
     def _set_pending(self, pkt_type, retry_timeout=1.0):
         self._pending = pkt_type
@@ -414,10 +477,8 @@ class NeptunConnector(threading.Thread):
             self.log('Too many retries, giving up pending request')
             self._clear_pending()
             return
-
+        # повторяем тот же запрос
         self._pending_retries += 1
-        self.log(f"Retry {self._pending_retries}/{self._pending_max_retries} for pending packet 0x{self._pending:02X}")
-
         if self._pending == PACKET_COUNTER_NAME:
             self._raw_send_counter_names()
         elif self._pending == PACKET_COUNTER_STATE:
@@ -427,19 +488,18 @@ class NeptunConnector(threading.Thread):
         elif self._pending == PACKET_SENSOR_STATE:
             self._raw_send_sensor_state()
         else:
+            # на всякий случай сброс
             self._clear_pending()
             return
-
-        # экспоненциальный backoff (до 8 секунд)
-        self._pending_retry_timeout = min(self._pending_retry_timeout * 2.0, 8.0)
         self._pending_sent = datetime.datetime.now()
 
-    # ------------------- TCP framing by explicit length -------------------
+    # ------------------- TCP разбор по длине -------------------
 
     def _process_rxbuf(self, sock):
         """
         Разбор TCP-потока по полю длины.
-        Кадр: 0x02 0x54 <dir> <type> <len_hi> <len_lo> <payload> <crc_hi> <crc_lo>
+        Кадр имеет формат:
+        0x02 0x54 <dir> <type> <len_hi> <len_lo> <payload:[len]> <crc_hi> <crc_lo>
         """
         START2 = b'\x02\x54'
 
@@ -457,7 +517,7 @@ class NeptunConnector(threading.Thread):
                 break
 
             payload_len = (self._rxbuf[4] << 8) | self._rxbuf[5]
-            total_len = 6 + payload_len + 2  # header + payload + CRC
+            total_len = 6 + payload_len + 2  # header + payload + CRC16
 
             if len(self._rxbuf) < total_len:
                 break
@@ -473,9 +533,12 @@ class NeptunConnector(threading.Thread):
             except Exception as e:
                 self.log_traceback('Unhandled exception in frame handler', e)
 
-    # ------------------- IO loop -------------------
+    # ------------------- Приём/цикл -------------------
 
     def check_incoming(self):
+        """
+        Check incoming data, close unused TCP connections.
+        """
         if self.socket is None:
             return
 
@@ -500,33 +563,28 @@ class NeptunConnector(threading.Thread):
                 else:
                     data = self.socket.sock.recv(SOCKET_BUFSIZE)
                     if not data:
-                        # даже если данных нет — проверим ретраи pending
-                        self._retry_pending_if_needed()
                         return True
                     if self.debug_mode > 1:
                         self.log('<--', self.ip, ":", self._formatBuffer(data))
                     self._rxbuf += data
                     self._process_rxbuf(self.socket)
-
-            # проверяем ретраи после обработки
-            self._retry_pending_if_needed()
             return True
 
-        except socket.timeout:
-            self._retry_pending_if_needed()
+        except socket.timeout as e:
+            pass
 
         except socket.error as e:
             if e.errno == errno.ECONNRESET:
-                self.log("Disconnected by peer (%r)" % (e,))
+                self.log("Disconnected by peer (%r)" % (e))
                 self.socket.disconnect()
             else:
-                self.log("Other socket error (%r)" % (e,))
+                self.log("Other socket error (%r)" % (e))
 
         except Exception as e:
             self.log_traceback("Can't incoming data %r" % (data if 'data' in locals() else None), e)
             raise
 
-    # ------------------- Decoder -------------------
+    # ------------------- Декодирование пакетов -------------------
 
     def handle_incoming_data(self, sock, ip, data):
         """
@@ -550,7 +608,7 @@ class NeptunConnector(threading.Thread):
             if self.data_callback is not None:
                 data = bytearray(data)
                 data_len = len(data) - 2
-                del data[data_len:]  # remove CRC
+                del data[data_len:]
                 packet_type = data[3]
 
                 callback_data['type'] = packet_type
@@ -572,60 +630,115 @@ class NeptunConnector(threading.Thread):
                     # system state
                     self.device['lines'] = {}
                     offset = 6
-                    while offset < data_len:
+                    while (offset < data_len):
                         tag = data[offset]
                         offset += 1
                         tag_size = data[offset] * 0x100 + data[offset + 1]
                         offset += 2
                         offset2 = offset
-                        if tag == 73:  # 0x49
-                            self.device['type'] = chr(data[offset2]) + chr(data[offset2+1])
-                            offset2 += 2
-                            self.device['version'] = chr(data[offset2]) + '.' + \
-                                chr(data[offset2+1]) + '.' + chr(data[offset2+2])
-                        elif tag == 78:  # 0x4E
-                            str_data = data[offset2:offset2+tag_size]
-                            self.device['name'] = str_data.decode('ascii')
-                        elif tag == 77:  # 0x4D
-                            str_data = data[offset2:offset2+tag_size]
-                            self.device['mac'] = str_data.decode('ascii')
-                        elif tag == 65:  # 0x41
-                            access = (tag_size > 0) and (data[offset2] > 0)
+
+                        if tag == 0x49:  # type + version (в 2.2 приходит строкой, напр. 'N3220')
+                            raw = data[offset2:offset2 + tag_size]
+                            try:
+                                s = raw.decode('ascii', errors='ignore')
+                                if len(s) >= 5:
+                                    self.device['type'] = s[:2]
+                                    self.device['version'] = s[2] + '.' + s[3] + '.' + s[4]
+                                else:
+                                    if tag_size >= 5:
+                                        self.device['type'] = chr(data[offset2]) + chr(data[offset2 + 1])
+                                        self.device['version'] = chr(data[offset2 + 2]) + '.' + \
+                                                                 chr(data[offset2 + 3]) + '.' + \
+                                                                 chr(data[offset2 + 4])
+                            except Exception:
+                                pass
+
+                        elif tag == 0x4E:  # name
+                            str_data = data[offset2:offset2 + tag_size]
+                            self.device['name'] = str_data.decode('ascii', errors='ignore')
+
+                        elif tag == 0x4D:  # MAC
+                            str_data = data[offset2:offset2 + tag_size]
+                            self.device['mac'] = str_data.decode('ascii', errors='ignore')
+
+                        elif tag == 0x41:  # access
+                            access = False
+                            if (tag_size > 0) and (data[offset2] > 0):
+                                access = True
                             self.device['access'] = access
-                        elif tag == 83:  # 0x53
+
+                        elif tag == 0x53:  # основные флаги/счётчики
                             self._update_timestamp()
-                            self.device['valve_state_open'] = data[offset2] == 1
-                            offset2 += 1
-                            self.device['sensor_count'] = data[offset2]
-                            offset2 += 1
-                            self.device['relay_count'] = data[offset2]
-                            offset2 += 1
-                            self.device['flag_dry'] = data[offset2] == 1
-                            offset2 += 1
-                            self.device['flag_cl_valve'] = data[offset2] == 1
-                            offset2 += 1
-                            self.device['line_in_config'] = data[offset2]
-                            offset2 += 1
-                            self.device['status'] = data[offset2]
-                            self.device['status_name'] = self.decode_status(data[offset2])
-                        elif tag == 115:  # 0x73
-                            # wired lines state
-                            for idx in range(4):
-                                sensor_info = self.get_line_info(idx)
-                                sensor_info['state'] = data[offset2]
-                                self.set_line_info(idx, sensor_info)
-                                offset2 += 1
+                            # ожидаемый порядок байт:
+                            # [0]=valve_open, [1]=sensor_count, [2]=relay_count,
+                            # [3]=flag_dry, [4]=flag_cl_valve, [5]=line_in_config, [6]=status (если есть)
+                            if tag_size >= 6:
+                                i = offset2
+                                self.device['valve_state_open'] = data[i] == 1; i += 1
+                                self.device['sensor_count'] = data[i]; i += 1
+                                self.device['relay_count'] = data[i]; i += 1
+                                self.device['flag_dry'] = data[i] == 1; i += 1
+                                self.device['flag_cl_valve'] = data[i] == 1; i += 1
+                                self.device['line_in_config'] = data[i]; i += 1
+                                if (i - offset2) < tag_size:
+                                    self.device['status'] = data[i]
+                                    self.device['status_name'] = self.decode_status(data[i])
+
+                        elif tag == 0x73:
+                            # СТАРЫЙ ФОРМАТ: 4 байта — по одному состоянию на линию
+                            # НОВЫЙ ФОРМАТ (FW 2.2): 16 байт — 4 набора по 4 байта: (u16, u16) на линию
+                            if tag_size == 4:
+                                i = offset2
+                                for idx in range(4):
+                                    sensor_info = self.get_line_info(idx)
+                                    sensor_info['state'] = data[i]
+                                    self.set_line_info(idx, sensor_info)
+                                    i += 1
+                            elif tag_size == 16:
+                                i = offset2
+                                for idx in range(4):
+                                    w1 = (data[i] << 8) | data[i + 1]
+                                    w2 = (data[i + 2] << 8) | data[i + 3]
+                                    i += 4
+                                    sensor_info = self.get_line_info(idx)
+                                    sensor_info['state_code'] = w1
+                                    sensor_info['state_word'] = w2
+                                    sensor_info['state'] = 1 if w2 != 0 else 0
+                                    self.set_line_info(idx, sensor_info)
+                            else:
+                                # неизвестный размер — просто сохраним сырые данные
+                                self.device['wired_raw'] = bytes(data[offset2:offset2 + tag_size])
+
+                        elif tag == 0x4C:
+                            # 4 байта — пока не декодируем, но сохраним
+                            self.device['l_flags_raw'] = bytes(data[offset2:offset2 + tag_size])
+
+                        elif tag == 0x43:
+                            # 20 байт — какие-то счётчики/времена, сохраним “как есть”
+                            self.device['counters_raw'] = bytes(data[offset2:offset2 + tag_size])
+
+                        elif tag == 0x44:
+                            # 10 байт — ASCII timestamp (или другое ASCII поле)
+                            try:
+                                ts = data[offset2:offset2 + tag_size].decode('ascii', errors='ignore')
+                                self.device['device_time'] = ts
+                            except Exception:
+                                pass
+
+                        elif tag == 0x57:
+                            # 1 байт — флаги FW/доступа
+                            if tag_size >= 1:
+                                self.device['fw_flags'] = data[offset2]
+
+                        # следующий TLV
                         offset += tag_size
 
-                    # маленькая пауза перед стартом цепочки и запуск с pending
-                    try:
-                        time.sleep(0.2)
-                    except:
-                        pass
+                    # старт цепочки с учётом pending/ретраев
                     self.got_counter_names = False
                     self._send_with_pending(PACKET_COUNTER_NAME, self._raw_send_counter_names, retry_timeout=1.0)
 
                 elif packet_type == PACKET_COUNTER_NAME:
+                    # получили ожидаемый ответ — очистим pending и продолжим цепочку
                     self._clear_pending()
                     self.got_counter_names = True
                     offset = 4
@@ -644,7 +757,7 @@ class NeptunConnector(threading.Thread):
                         else:
                             line_type = 'sensor'
                         sensor_info = self.get_line_info(idx)
-                        sensor_info['name'] = sensor_name.decode('cp1251')
+                        sensor_info['name'] = sensor_name.decode('cp1251', errors='ignore')
                         sensor_info['type'] = line_type
                         sensor_info['wire'] = True
                         self.set_line_info(idx, sensor_info)
@@ -659,7 +772,7 @@ class NeptunConnector(threading.Thread):
                     offset += 2
 
                     idx = 0
-                    while offset < data_len:
+                    while (offset < data_len):
                         sensor_info = self.get_line_info(idx)
                         value = (data[offset]   << 24) + \
                                 (data[offset+1] << 16) + \
@@ -685,7 +798,7 @@ class NeptunConnector(threading.Thread):
                     idx = 4
                     for sensor_name in sensor_names:
                         sensor_info = self.get_line_info(idx)
-                        sensor_info['name'] = sensor_name.decode('cp1251')
+                        sensor_info['name'] = sensor_name.decode('cp1251', errors='ignore')
                         sensor_info['type'] = 'sensor'
                         sensor_info['wire'] = False
                         self.set_line_info(idx, sensor_info)
@@ -701,7 +814,7 @@ class NeptunConnector(threading.Thread):
                     offset += 2
 
                     idx = 4
-                    while offset < data_len:
+                    while (offset < data_len):
                         sensor_info = self.get_line_info(idx)
                         sensor_info['signal'] = data[offset]
                         sensor_info['line'] = data[offset + 1]
@@ -720,13 +833,9 @@ class NeptunConnector(threading.Thread):
                         self.device['status'] = data[offset]
                         self.device['status_name'] = self.decode_status(data[offset])
 
-                elif packet_type == PACKET_ACK:
-                    # Просто keepalive — мягко подождём и, если есть pending, повторим по таймеру
-                    pass
-
-                elif packet_type == PACKET_BUSY:
-                    # устройство занято — ретраи обработает _retry_pending_if_needed()
-                    self.log("Device returned BUSY (0xFE), will retry pending shortly")
+                elif packet_type in (PACKET_ACK, PACKET_BUSY):
+                    # устройство занято — повторим последний «значимый» запрос при необходимости
+                    self._retry_pending_if_needed()
 
                 try:
                     self.data_callback(self, sock, ip, callback_data)
@@ -741,6 +850,9 @@ class NeptunConnector(threading.Thread):
     # ------------------- Очередь отправки -------------------
 
     def send_from_queue(self):
+        """
+        Send a message from a queue.
+        """
         command = None
         try:
             if not self.command_queue.empty():
@@ -766,6 +878,9 @@ class NeptunConnector(threading.Thread):
             self.command_queue.task_done()
 
     def send_command(self, data, ip, port, timeout):
+        """
+        Add a command to a queue.
+        """
         self.log("++Q (" + ip + ':' + str(port) + ") :", data)
         self.command_queue.put({'data': data, 'ip': ip, 'port': port, 'timeout': timeout})
 
@@ -797,10 +912,14 @@ class NeptunConnector(threading.Thread):
         builder_fn()
         self._set_pending(pkt_type, retry_timeout)
 
-    # ------------------- Публичные методы -------------------
+    # ------------------- Публичные методы (интерфейс для neptun2mqtt.py) -------------------
 
     def send_whois(self):
+        """
+        Whois command: for the  broadcast (UDP) connector only.
+        """
         data = bytearray([2, 84, 81, PACKET_WHOIS, 0, 0])
+        # crc must be 0x99, 0xD7
         data = crc16_append(data)
         self.whois_request.last_sent = datetime.datetime.now()
         self.send_command(data, BROADCAST_ADDRESS, BROADCAST_PORT, 0)
@@ -808,7 +927,7 @@ class NeptunConnector(threading.Thread):
 
     def send_reconnect(self):
         """
-        Держим для совместимости, но больше НЕ вызываем автоматически.
+        Reconnect data packet.
         """
         data = bytearray([2, 84, 81, PACKET_RECONNECT, 0, 3, 82])
         data = crc16_append(data)
@@ -816,6 +935,7 @@ class NeptunConnector(threading.Thread):
         return self
 
     def send_get_counter_names(self):
+        # оставлено для внешних вызовов, внутри логики используем _send_with_pending
         self._send_with_pending(PACKET_COUNTER_NAME, self._raw_send_counter_names, retry_timeout=1.0)
         return self
 
@@ -838,10 +958,13 @@ class NeptunConnector(threading.Thread):
         data = bytearray([2, 84, 81, PACKET_SYSTEM_STATE, 0, 0])
         data = crc16_append(data)
         self.send_command(data, self.ip, self.port, 30)  # увеличенный таймаут
-        # SYSTEM_STATE не кладём в pending — ответ приходит сразу, далее начнётся цепочка
+        # SYSTEM_STATE не добавляем в pending — ответ приходит сразу, а дальше начнётся цепочка
         return self
 
     def send_get_background_status(self):
+        """
+        Get main (overall) status.
+        """
         data = bytearray([2, 84, 81, PACKET_BACK_STATE, 0, 0])
         data = crc16_append(data)
         self.send_command(data, self.ip, self.port, 30)
@@ -868,11 +991,19 @@ class NeptunConnector(threading.Thread):
         return self
 
     def send_set_valve_state(self, is_open):
+        """
+        Open/close valve.
+        """
         self.send_settings(is_open, self.device.get('flag_dry', False),
-                           self.device.get('flag_cl_valve', False), self.device.get('line_in_config', 0))
+                           self.device.get('flag_cl_valve', False),
+                           self.device.get('line_in_config', 0))
         return self
 
     def send_set_cleaning_mode(self, is_enabled):
+        """
+        Set/unset a cleaning mode flag.
+        """
         self.send_settings(self.device.get('valve_state_open', False), is_enabled,
-                           self.device.get('flag_cl_valve', False), self.device.get('line_in_config', 0))
+                           self.device.get('flag_cl_valve', False),
+                           self.device.get('line_in_config', 0))
         return self
