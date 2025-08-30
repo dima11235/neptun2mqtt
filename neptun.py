@@ -1,4 +1,4 @@
-print("### NEPTUN.PY BUILD: 2025-08-29-FW2_2-LEN-FRAMING-RETRY ###")
+print("### NEPTUN.PY BUILD: 2025-08-30-4 ###")
 
 from six import string_types
 import sys, traceback
